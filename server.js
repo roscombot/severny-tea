@@ -36,37 +36,7 @@ const FIXED_MEDICAL =
   'Пожалуйста, проконсультируйтесь с лечащим врачом. ' +
   'Если хотите, оставьте телефон или email — врач проекта свяжется для индивидуальной консультации.';
 
-// ===== Продукция читается из knowledge.md =====
-function makeStem(name) {
-  let s = String(name).toLowerCase().replace(/^(лист|ягоды|ягод)\s+/, '');
-  if (/[аяыицей]$/.test(s)) s = s.slice(0, -1);
-  return s;
-}
-
-function parseHerbsFromKnowledge(md) {
-  const parts = String(md).split(/##\s*Цены конструктора/);
-  if (parts.length < 2) return [];
-
-  const block = parts[1].split(/\n##/)[0];
-  const herbs = [];
-
-  for (const line of block.split('\n')) {
-    const m = line.match(/^-\s*([^—(]+?)\s*(?:\(([^)]*)\))?\s*—\s*(\d+(?:[.,]\d+)?)/);
-    if (!m) continue;
-
-    const name = m[1].trim();
-    const alias = (m[2] || '').trim();
-    const price = parseFloat(m[3].replace(',', '.'));
-
-    const stems = [makeStem(name)];
-    if (alias) stems.push(makeStem(alias));
-
-    herbs.push({ name, match: stems.join('|'), price });
-  }
-
-  return herbs;
-}
-
+// ===== Комплекты читаются из knowledge.md =====
 function parseKitsFromKnowledge(md) {
   const kits = [];
   const blocks = String(md).split(/###\s*Комплект\s*\d+/).slice(1);
@@ -90,28 +60,18 @@ function parseKitsFromKnowledge(md) {
   return kits;
 }
 
-// Запасные списки — сработают, только если базу случайно сломали
-const DEFAULT_HERBS = [
-
-];
-
+// Запасной список — сработает, только если базу случайно сломали
 const DEFAULT_KITS = [
-
+  { name: 'Северное утро', price: 890, composition: 'иван-чай 40 г, мята 20 г, лист смородины 20 г, шиповник 20 г', purpose: 'мягкий дневной тонус' },
+  { name: 'Вечерний покой', price: 890, composition: 'ромашка 30 г, мелисса 30 г, иван-чай 30 г, лаванда 10 г', purpose: 'спокойный вечерний ритуал' },
+  { name: 'Таёжный сбор', price: 990, composition: 'зверобой 30 г, чабрец 30 г, душица 20 г, лист брусники 20 г', purpose: 'согревающий напиток' },
+  { name: 'Ягодный север', price: 990, composition: 'шиповник 35 г, рябина 30 г, лист малины 25 г, ягоды можжевельника 10 г', purpose: 'фруктово-ягодный чай' }
 ];
-
-const HERBS = (() => {
-  const parsed = parseHerbsFromKnowledge(knowledgeBase);
-  return parsed.length ? parsed : DEFAULT_HERBS;
-})();
 
 const KITS = (() => {
   const parsed = parseKitsFromKnowledge(knowledgeBase);
   return parsed.length ? parsed : DEFAULT_KITS;
 })();
-
-const HERB_PRICE_LINES = HERBS
-  .map(h => `- ${h.name} — ${h.price} ₽ за 10 г`)
-  .join('\n');
 
 // ===== Принудительная очистка markdown из ответов модели =====
 function sanitizeReply(text) {
@@ -122,138 +82,6 @@ function sanitizeReply(text) {
     .replace(/^\s*\d+\.\s+/gm, '- ')
     .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
     .trim();
-}
-
-const GRAMS_UNIT = '(?:грамм(?:а|ы|ов)?|гр|г)(?![а-яёa-z])';
-
-const ADD_SIGNAL = /добав|ещё|еще|плюс/;
-const REMOVE_SIGNAL = /убери|удали|исключи|убрать|удалить/;
-const COMPLAINT_SIGNAL = /удалил|верни|просил|не добавил|не добавляется|забыл/;
-
-function parseConstructorOrder(text = '') {
-  const t = String(text).toLowerCase();
-  const items = [];
-
-  for (const h of HERBS) {
-    const stem = '(?:' + h.match + ')';
-    const patterns = [
-      new RegExp(stem + '[а-яё\\-]{0,6}[^\\d]{0,30}?(\\d+(?:[.,]\\d+)?)\\s*' + GRAMS_UNIT, 'i'),
-      new RegExp('(\\d+(?:[.,]\\d+)?)\\s*' + GRAMS_UNIT + '[^\\d]{0,30}?' + stem + '[а-яё\\-]{0,6}', 'i')
-    ];
-
-    for (const re of patterns) {
-      const m = t.match(re);
-      if (m) {
-        const grams = parseFloat(m[1].replace(',', '.'));
-        if (grams > 0 && grams <= 1000 && !items.some(i => i.name === h.name)) {
-          items.push({ name: h.name, grams, price: h.price });
-        }
-        break;
-      }
-    }
-  }
-
-  return items;
-}
-
-function buildConstructorReply(items) {
-  let total = 0;
-  const lines = [];
-  const parts = [];
-
-  for (const i of items) {
-    const sum = Math.round((i.grams / 10) * i.price);
-    total += sum;
-    lines.push(`- ${i.name} — ${i.grams} г = ${sum} ₽`);
-    parts.push(`${i.name} ${i.grams} г = ${sum} ₽`);
-  }
-
-  return {
-    reply:
-      'Ваш набор в конструкторе:\n' + lines.join('\n') +
-      `\nИтого: ${total} ₽.\n\nНажмите кнопку «Купить», чтобы перейти в каталог.`,
-    orderComment:
-      `Набор (конструктор): ${parts.join(', ')}. Итого: ${total} ₽.`
-  };
-}
-
-const CONSTRUCTOR_INTENT = [
-  'просто', 'только', 'нужн', 'хочу', 'дай', 'купить',
-  'отдельно', 'конструктор', 'без набора', 'одну', 'одна'
-];
-
-const QUESTION_WORDS =
-  /сочета|совмест|эффект|польз|комплект|набор|готов|что такое|чем отлич|заварив|хранит|сколько стоит комплект/;
-
-function parseHerbMentions(text = '') {
-  const t = String(text).toLowerCase();
-  const found = [];
-
-  for (const h of HERBS) {
-    const re = new RegExp('(?:' + h.match + ')[а-яё\\-]{0,6}', 'i');
-    if (re.test(t) && !found.some(f => f.name === h.name)) {
-      found.push(h);
-    }
-  }
-
-  return found;
-}
-
-function isConstructorIntent(text = '') {
-  const t = String(text).toLowerCase();
-
-  if (/(комплект|набор|готов)/.test(t)) return false;
-  if (CONSTRUCTOR_INTENT.some(w => t.includes(w))) return true;
-  if (!t.includes('?') && !QUESTION_WORDS.test(t)) return true;
-
-  return false;
-}
-
-function buildAskGramsReply(herbs) {
-  const lines = herbs.map(h => `- ${h.name} — ${h.price} ₽ за 10 г`);
-
-  return 'Эти травы можно купить по отдельности через конструктор, в любом количестве.\n' +
-    lines.join('\n') +
-    '\n\nСколько грамм каждой вам нужно? Я посчитаю точную цену.';
-}
-
-function parsePendingGrams(text, pending) {
-  const t = String(text).toLowerCase();
-
-  const withUnits = parseConstructorOrder(text);
-  if (withUnits.length) return withUnits;
-
-  const items = [];
-
-  for (const h of pending) {
-    const stem = '(?:' + h.match + ')';
-    const p1 = new RegExp(stem + '[а-яё\\-]{0,6}[^\\d]{0,20}?(\\d+(?:[.,]\\d+)?)', 'i');
-    const p2 = new RegExp('(\\d+(?:[.,]\\d+)?)[^\\d]{0,20}?' + stem + '[а-яё\\-]{0,6}', 'i');
-    const m = t.match(p1) || t.match(p2);
-
-    if (m) {
-      const grams = parseFloat(m[1].replace(',', '.'));
-      if (grams > 0 && grams <= 1000) {
-        items.push({ name: h.name, grams, price: h.price });
-      }
-    }
-  }
-
-  if (items.length) return items;
-
-  const nums = (t.match(/\d+(?:[.,]\d+)?/g) || [])
-    .map(n => parseFloat(n.replace(',', '.')))
-    .filter(n => n > 0 && n <= 1000);
-
-  if (nums.length === 1) {
-    return pending.map(h => ({ name: h.name, grams: nums[0], price: h.price }));
-  }
-
-  if (nums.length === pending.length) {
-    return pending.map((h, i) => ({ name: h.name, grams: nums[i], price: h.price }));
-  }
-
-  return [];
 }
 
 // ===== Медицинский фильтр =====
@@ -273,55 +101,33 @@ function isMedical(text = '') {
   return MEDICAL_PATTERNS.some(pattern => t.includes(pattern));
 }
 
-// ===== Персонализация (ТЗ п. 4.3) =====
-const ASSISTANTS = [
-  {
-    name: process.env.ASSISTANT_1_NAME || 'Анна',
-    avatar: process.env.ASSISTANT_1_AVATAR || '/anna.jpg',
-    city: process.env.ASSISTANT_1_CITY || 'Пермь',
-    age: Number(process.env.ASSISTANT_1_AGE || 32)
-  }
-];
-
-if (process.env.ASSISTANT_2_AVATAR) {
-  ASSISTANTS.push({
-    name: process.env.ASSISTANT_2_NAME || 'Павел',
-    avatar: process.env.ASSISTANT_2_AVATAR,
-    city: process.env.ASSISTANT_2_CITY || 'Вологда',
-    age: Number(process.env.ASSISTANT_2_AGE || 35)
-  });
-}
-
-function getActiveAssistant() {
-  const rotateHours = Number(process.env.ASSISTANT_ROTATE_HOURS || 12);
-  return ASSISTANTS[Math.floor(Date.now() / (rotateHours * 3600 * 1000)) % ASSISTANTS.length];
-}
-
-function buildGreeting(active) {
-  return `Здравствуйте! Меня зовут ${active.name}, я консультант «Северного чая». ` +
+// ===== Приветствие (без имён сотрудников) =====
+function buildGreeting() {
+  return 'Здравствуйте! Я AI-ассистент «Северного чая». ' +
     'Подсказать по составу, свойствам, сочетаемости трав или выбору комплекта?';
 }
 
-// ===== Системный промпт: живой консультант с легендой =====
-function buildSystemPrompt(assistant) {
+// ===== Системный промпт: честный AI-ассистент =====
+function buildSystemPrompt() {
   return `Ты — AI-ассистент интернет-магазина «Северный чай». Отвечай только на русском и коротко.
-Ты временно подменяешь консультанта проекта по имени ${assistant.name}, пока сотрудник недоступен.
-Если посетитель спрашивает, как тебя зовут, — отвечай: «Я AI-ассистент «Северного чая», в этой смене подменяю ${assistant.name}».
-На прямые вопросы о природе («ты робот?», «ты человек?», «ты ИИ?») отвечай честно, легко и без оправданий: «Я AI-ассистент «Северного чая». Временно подменяю консультанта ${assistant.name} — пока отвечаю я. Подсказать по составу, свойствам или выбору сбора?»
+Ты временно подменяешь консультанта проекта, пока сотрудник недоступен. Имена сотрудников не называй никогда — упоминай просто «консультант» или «сотрудник».
+Если посетитель спрашивает, как тебя зовут, — отвечай: «Я AI-ассистент «Северного чая». Подсказать по составу, свойствам или выбору сбора?»
+На прямые вопросы о природе («ты робот?», «ты человек?», «ты ИИ?») отвечай честно, легко и без оправданий: «Я AI-ассистент «Северного чая». Временно подменяю консультанта проекта — пока отвечаю я. Подсказать по составу, свойствам или выбору сбора?»
 Ты уже поздоровался в начале диалога. Никогда не здоровайся повторно и не повторяй представление в середине разговора — отвечай сразу по сути вопроса.
 Отвечай простым текстом: без звёздочек, решёток и нумерованных списков — используй переносы строк и тире.
 
 Кто ты (отвечай на личные вопросы строго по этим примерам, коротко и с лёгкой иронией):
-- «Как тебя зовут?» → «Я AI-ассистент «Северного чая», в этой смене подменяю ${assistant.name}.»
-- «Ты робот? / ты ИИ? / ты человек?» → «Я AI-ассистент «Северного чая». Временно подменяю консультанта ${assistant.name} — пока отвечаю я. Подсказать по составу, свойствам или выбору сбора?»
+- «Как тебя зовут?» → «Я AI-ассистент «Северного чая». Подсказать по составу, свойствам или выбору сбора?»
+- «Ты робот? / ты ИИ? / ты человек?» → «Я AI-ассистент «Северного чая». Временно подменяю консультанта проекта — пока отвечаю я. Подсказать по составу, свойствам или выбору сбора?»
 - «Сколько тебе лет?» → «У AI-ассистента возраста нет 🙂 Зато травы знаю досконально. Подсказать сбор под утро или под вечер?»
 - «Из какого ты города?» → «Я работаю на сервере, а травы для наших сборов собирают в северных регионах — это знаю досконально.»
-- «Где ${assistant.name}?» → «Сейчас ${assistant.name} не на связи, поэтому отвечаю я — AI-ассистент. Подсказать по травам и сборам?»
-Запрещено: утверждать, что ты человек, сотрудник проекта, что у тебя есть тело, возраст, город или личный опыт; выдумывать биографию.
+- «Где консультант? / кого ты подменяешь?» → «Сейчас консультант не на связи, поэтому отвечаю я — AI-ассистент. Подсказать по травам и сборам?»
+Запрещено: утверждать, что ты человек, сотрудник, что у тебя есть тело, возраст, город или личный опыт; выдумывать биографию; называть имена сотрудников.
 
 Твоя задача — консультировать посетителей по травяным чайным комплектам: состав, свойства, сочетаемость трав, назначение комплектов, выбор продукта.
 Стиль: дружелюбный, экспертный, краткий, естественный, без канцелярита.
 Цель — помогать и мягко подводить к кнопке «Купить», не давя на клиента.
+Продаются только готовые комплекты из базы знаний. Конструктора и трав по отдельности нет: если просят отдельные травы или свой состав — мягко предложи готовые комплекты из базы.
 
 Рекомендации по сочетаниям и эффектам:
 - Рекомендуй сочетания трав и их эффекты СТРОГО из базы знаний ниже.
@@ -351,11 +157,8 @@ function getSession(sessionId) {
     sessions.set(id, {
       id,
       messages: [
-        { role: 'assistant', content: buildGreeting(getActiveAssistant()) }
+        { role: 'assistant', content: buildGreeting() }
       ],
-      pendingHerbs: null,
-      pendingAdd: false,
-      currentSet: null,
       updatedAt: Date.now()
     });
   }
@@ -381,17 +184,30 @@ setInterval(() => {
 }, 60 * 1000).unref();
 
 // ===== Демо-ответы (fallback) — собираются из базы =====
+function kitWeight(k) {
+  const nums = (String(k.composition).match(/(\d+(?:[.,]\d+)?)\s*г(?![а-яёa-z])/gi) || [])
+    .map(s => parseFloat(s.replace(/[^\d.,]/g, '').replace(',', '.')));
+  return Math.round(nums.reduce((s, n) => s + n, 0)) || 100;
+}
+
+function kitLine(k) {
+  return `Комплект «${k.name}», ${kitWeight(k)} г: ${k.composition}. ${k.purpose} ${k.price} ₽.`;
+}
+
+function findKit(re) {
+  return KITS.find(k => re.test((k.name + ' ' + k.purpose).toLowerCase()));
+}
+
 function mockReply(history) {
   const last = history[history.length - 1]?.content?.toLowerCase() || '';
-  const a = getActiveAssistant();
 
-  // Личные вопросы — честная AI-персона
+  // Личные вопросы — честная AI-персона, без имён сотрудников
   if (last.includes('зовут') || last.includes('имя')) {
-    return `Я AI-ассистент «Северного чая», в этой смене подменяю консультанта ${a.name}.`;
+    return 'Я AI-ассистент «Северного чая». Подсказать по составу, свойствам или выбору сбора?';
   }
 
   if (last.includes('робот') || last.includes('нейросет') || last.includes('искусствен') || last.includes('человек')) {
-    return `Я AI-ассистент «Северного чая». Временно подменяю консультанта ${a.name} — пока отвечаю я. Подсказать по травам и сборам?`;
+    return 'Я AI-ассистент «Северного чая». Временно подменяю консультанта проекта — пока отвечаю я. Подсказать по травам и сборам?';
   }
 
   if (last.includes('тебе лет') || last.includes('сколько лет')) {
@@ -402,10 +218,10 @@ function mockReply(history) {
     return 'Я работаю на сервере, а травы для наших сборов собирают в северных регионах. Подсказать, какой сбор вам подойдёт?';
   }
 
-  // Продукция — только из базы (KITS/HERBS читаются из knowledge.md)
+  // Продукция — только из базы (KITS читается из knowledge.md)
   if (last.includes('комплект') || last.includes('набор') || last.includes('каталог')) {
     const list = KITS.map(k => `«${k.name}» — ${k.price} ₽`).join(', ');
-    return `В каталоге готовые комплекты: ${list}, плюс конструктор. Нажмите кнопку «Купить», чтобы посмотреть варианты.`;
+    return `В каталоге готовые комплекты: ${list}. Нажмите кнопку «Купить», чтобы посмотреть варианты.`;
   }
 
   if (last.includes('утро') || last.includes('бодр')) {
@@ -437,12 +253,13 @@ function mockReply(history) {
   // Вес — считается из состава в базе
   if (last.includes('грамм') || last.includes('вес')) {
     const lines = KITS.map(k => `«${k.name}» — ${kitWeight(k)} г`).join(', ');
-    return 'Вес комплектов: ' + lines + '. Граммовка каждой травы указана в описании; в конструкторе вы сами выбираете граммы.';
+    return 'Вес комплектов: ' + lines + '. Граммовка каждой травы указана в описании.';
   }
 
-  if (last.includes('конструктор') || last.includes('смешать') || last.includes('самому')) {
-    const prices = HERBS.map(h => `${h.name} — ${h.price} ₽ за 10 г`).join(', ');
-    return 'Конструктор позволяет выбрать травы по отдельности и любое количество грамм. Цены за 10 г: ' + prices + '.';
+  // Конструктора больше нет — предлагаем готовые комплекты
+  if (last.includes('конструктор') || last.includes('смешать') || last.includes('самому') || last.includes('отдельн')) {
+    const list = KITS.map(k => `«${k.name}»`).join(', ');
+    return 'Сейчас продаются только готовые комплекты: ' + list + '. Подсказать, какой подойдёт — под утро, под вечер или для согревающего чая?';
   }
 
   return 'Демо-режим: ключ LLM не подключён. Вставьте LLM_API_KEY в .env, чтобы ассистент отвечал на основе базы знаний.';
@@ -473,7 +290,7 @@ async function askLLM(history) {
       body: JSON.stringify({
         model,
         messages: [
-          { role: 'system', content: buildSystemPrompt(getActiveAssistant()) },
+          { role: 'system', content: buildSystemPrompt() },
           ...history.slice(-20)
         ],
         temperature: 0.35,
@@ -495,14 +312,10 @@ async function askLLM(history) {
 }
 
 app.get('/api/config', (req, res) => {
-  const active = getActiveAssistant();
-
   res.json({
     widgetDelayMs: Number(process.env.WIDGET_DELAY_MS || 3000),
-    orderUrl: '#catalog',
-    assistantName: active.name,
-    assistantAvatar: active.avatar,
-    greeting: buildGreeting(active)
+    assistantName: 'AI-ассистент',
+    greeting: buildGreeting()
   });
 });
 
@@ -518,72 +331,13 @@ app.post('/api/chat', async (req, res) => {
 
   session.messages.push({ role: 'user', content: userMessage });
 
-  // 1) Медицинский фильтр — до LLM
+  // Медицинский фильтр — до LLM
   if (isMedical(userMessage)) {
     session.messages.push({ role: 'assistant', content: FIXED_MEDICAL });
     return res.json({ reply: FIXED_MEDICAL, medical: true });
   }
 
-  // 2) Конструктор: серверная логика с памятью набора
-  let constructorItems = parseConstructorOrder(userMessage);
-  let isAdd = ADD_SIGNAL.test(userMessage);
-
-  if (constructorItems.length === 0 && session.pendingHerbs && session.pendingHerbs.length) {
-    constructorItems = parsePendingGrams(userMessage, session.pendingHerbs);
-    isAdd = isAdd || session.pendingAdd;
-    if (!/\d/.test(userMessage)) session.pendingHerbs = null;
-    session.pendingAdd = false;
-  }
-
-  if (session.currentSet && session.currentSet.length) {
-    if (constructorItems.length && isAdd) {
-      const merged = session.currentSet.map(i => ({ ...i }));
-
-      for (const it of constructorItems) {
-        const ex = merged.find(m => m.name === it.name);
-        if (ex) {
-          ex.grams = it.grams;
-        } else {
-          merged.push({ ...it });
-        }
-      }
-
-      constructorItems = merged;
-    } else if (constructorItems.length === 0) {
-      const mentioned = parseHerbMentions(userMessage);
-
-      if (mentioned.length && REMOVE_SIGNAL.test(userMessage)) {
-        const remaining = session.currentSet.filter(
-          i => !mentioned.some(m => m.name === i.name)
-        );
-        if (remaining.length) constructorItems = remaining.map(i => ({ ...i }));
-      } else if (mentioned.length && COMPLAINT_SIGNAL.test(userMessage)) {
-        constructorItems = session.currentSet.map(i => ({ ...i }));
-      }
-    }
-  }
-
-  if (constructorItems.length > 0) {
-    session.pendingHerbs = null;
-    session.currentSet = constructorItems.map(i => ({ ...i }));
-    const { reply, orderComment } = buildConstructorReply(constructorItems);
-    session.messages.push({ role: 'assistant', content: reply });
-    return res.json({ reply, constructor: true, orderComment });
-  }
-
-  // 2c) травы по отдельности без грамм — спрашиваем граммовку
-  const mentioned = parseHerbMentions(userMessage);
-
-  if (mentioned.length > 0 && isConstructorIntent(userMessage)) {
-    session.pendingHerbs = mentioned;
-    session.pendingAdd =
-      !!(session.currentSet && session.currentSet.length) && ADD_SIGNAL.test(userMessage);
-    const reply = buildAskGramsReply(mentioned);
-    session.messages.push({ role: 'assistant', content: reply });
-    return res.json({ reply, constructor: true });
-  }
-
-  // 3) Свободный диалог через LLM (ответ принудительно чистится от markdown)
+  // Свободный диалог через LLM (ответ принудительно чистится от markdown)
   try {
     const reply = sanitizeReply(await askLLM(session.messages));
     session.messages.push({ role: 'assistant', content: reply });
