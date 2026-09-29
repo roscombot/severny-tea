@@ -1,4 +1,4 @@
-const express = require('express');
+=const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const { randomUUID } = require('crypto');
@@ -19,6 +19,8 @@ app.use((req, res, next) => {
 const PORT = process.env.PORT || 3000;
 const DEFAULT_LLM_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions';
 
+const VK_URL = 'https://vk.ru/zhizn_dolgoletie_energiya_cel';
+
 const knowledgeBase = (() => {
   try {
     return fs.readFileSync(path.join(__dirname, 'knowledge.md'), 'utf8');
@@ -27,20 +29,57 @@ const knowledgeBase = (() => {
   }
 })();
 
+// Медицинский ответ — с редиректом в ВК (автор проекта)
 const FIXED_MEDICAL =
   'По вопросам приёма лекарств, совместимости с препаратами и влияния на заболевания я не могу давать рекомендации. ' +
-  'Пожалуйста, проконсультируйтесь с лечащим врачом. ' +
-  'Если хотите, оставьте телефон или email — врач проекта свяжется для индивидуальной консультации.';
+  'Пожалуйста, проконсультируйтесь с лечащим врачом.\n\n' +
+  'Для индивидуальной консультации с автором проекта напишите в ВК: ' + VK_URL;
 
 const PRICE_REDIRECT =
   'Цена и условия заказа указаны в каталоге на сайте. Нажмите кнопку «Купить» в окне чата.';
 
-// Вес комплекта — из базы (раздел «Частые вопросы»)
+const NO_UNDERSTAND_REPLY =
+  'Не совсем понял ваш вопрос. Уточните, пожалуйста: интересует состав, свойства, выбор комплекта или что-то ещё?';
+
 const WEIGHT_NOTE =
   (knowledgeBase.match(/Каждый комплект[^\n]*/) || [''])[0] ||
   'Информации об этом в базе пока нет.';
 
-// ===== Парсер комплектов из базы =====
+const HERB_NAMES = [
+  'иван-чай', 'кипрей', 'душица', 'смородина', 'малина', 'брусника', 'пихта',
+  'клевер', 'родиола', 'элеутерококк', 'левзея', 'хмель', 'таволга', 'солодка', 'чага'
+];
+
+// ===== Разбор базы на секции =====
+const BASE_PARSED = (() => {
+  const headerRe = /^(#{1,6}\s*.+|Цены конструктора.*|Эффекты и польза трав|Сочетаемость трав|Правила конструктора.*|Ассортимент: готовые комплекты|Конструктор «[^»]+»|Доставка и оплата|Частые вопросы|Дополнительные частые вопросы по комплектам:|Для «[^»]+»:|Комплект \d+ «[^»]+»)$/;
+  const sections = [];
+  let cur = { title: '(начало)', lines: [] };
+  for (const raw of String(knowledgeBase).split('\n')) {
+    const line = raw.trim();
+    if (headerRe.test(line)) {
+      sections.push({ title: cur.title.replace(/^#+\s*/, ''), body: cur.lines.join('\n').trim() });
+      cur = { title: line.replace(/^#+\s*/, ''), lines: [] };
+    } else {
+      cur.lines.push(raw);
+    }
+  }
+  sections.push({ title: cur.title.replace(/^#+\s*/, ''), body: cur.lines.join('\n').trim() });
+  return sections.filter(s => s.body);
+})();
+
+// Справочные разделы — всегда в промпте
+const CORE_TEXT = BASE_PARSED
+  .filter(s => /Правила ответов|Цены конструктора|Сочетаемость|Правила конструктора|Конструктор «|Доставка и оплата|Частые вопросы|Дополнительные частые|^Для «/.test(s.title))
+  .map(s => s.title + '\n' + s.body)
+  .join('\n\n');
+
+const KIT_SECTIONS = BASE_PARSED.filter(s => /^Комплект \d/.test(s.title));
+
+const HERB_PARAS = (BASE_PARSED.find(s => /Эффекты и польза трав/.test(s.title)) || { body: '' })
+  .body.split('\n').map(s => s.trim()).filter(s => s.length > 40);
+
+// ===== Парсер коротких карточек комплектов =====
 function parseKitsFromKnowledge(md) {
   const kits = [];
   const re = /Комплект\s*\d+\s*«([^»]+)»([\s\S]*?)(?=Комплект\s*\d+\s*«|Конструктор|$)/g;
@@ -65,14 +104,73 @@ if (KITS.length === 0) {
   console.warn('ВНИМАНИЕ: в knowledge.md не найдено комплектов');
 }
 
+// Ключевые слова для каждого комплекта (для селективного контекста)
+const KIT_KEYS = [
+  ['энерг', 'утр', 'бодр', 'работоспособ', 'кофеин'],
+  ['сон', 'вечер', 'расслаб', 'засн', 'бессон'],
+  ['иммун', 'таёж', 'таеж', 'чага', 'согрев', 'простуд', 'орви'],
+  ['женщ', 'девуш', 'климакс', 'менопауз', 'месячн', 'прилив']
+];
+
+// Селективный контекст: в промпт идут только релевантные куски базы
+function buildBaseContext(history) {
+  const q = history.slice(-3).map(m => m.content).join(' ').toLowerCase();
+  const parts = ['=== СПРАВОЧНЫЕ РАЗДЕЛЫ БАЗЫ ===', CORE_TEXT];
+
+  const herbs = HERB_NAMES.filter(h => q.includes(h));
+
+  const chosenKits = KIT_SECTIONS.filter((s, i) => {
+    const keys = KIT_KEYS[i] || [];
+    const name = s.title.toLowerCase().replace(/комплект\s*\d+\s*/, '').replace(/«|»/g, '');
+    return keys.some(k => q.includes(k)) || q.includes(name);
+  });
+  const extraKits = KIT_SECTIONS.filter(
+    s => !chosenKits.includes(s) && herbs.some(h => s.body.toLowerCase().includes(h))
+  );
+  const kits = [...chosenKits, ...extraKits];
+
+  const chosenHerbs = HERB_PARAS.filter(p => {
+    const pl = p.toLowerCase();
+    return herbs.some(h => pl.includes(h));
+  });
+
+  if (kits.length) {
+    parts.push('=== КОМПЛЕКТЫ ===', kits.map(s => s.title + '\n' + s.body).join('\n\n'));
+  }
+  if (chosenHerbs.length) {
+    parts.push('=== ТРАВЫ ===', chosenHerbs.slice(0, 4).join('\n\n'));
+  }
+  if (!kits.length && !chosenHerbs.length) {
+    parts.push(
+      '=== КОМПЛЕКТЫ (КРАТКО) ===',
+      KITS.map(k => `«${k.name}» — ${k.purpose} Состав: ${k.composition}`).join('\n')
+    );
+  }
+  return parts.join('\n\n');
+}
+
 function sanitizeReply(text) {
-  return String(text || '')
+  let clean = String(text || '')
     .replace(/\*\*/g, '')
     .replace(/\*/g, '')
     .replace(/^#{1,6}\s+/gm, '')
     .replace(/^\s*\d+\.\s+/gm, '- ')
     .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
     .trim();
+
+  // Блок выдуманных цен (но пропускаем, если в ответе уже "Цены указаны в каталоге")
+  if (/\d+\s*(руб|рубл|₽|рублей|rub)/i.test(clean) && !clean.includes('Цены указаны в каталоге')) {
+    return PRICE_REDIRECT;
+  }
+  return clean;
+}
+
+// Проверка языка: сколько кириллицы в тексте
+function cyrillicRatio(text) {
+  const letters = String(text).replace(/[^a-zA-Zа-яА-ЯёЁ]/g, '');
+  if (!letters.length) return 1;
+  const cyr = (String(text).match(/[а-яА-ЯёЁ]/g) || []).length;
+  return cyr / letters.length;
 }
 
 const MEDICAL_PATTERNS = [
@@ -89,6 +187,11 @@ const MEDICAL_PATTERNS = [
 function isMedical(text = '') {
   const t = String(text || '').toLowerCase();
   return MEDICAL_PATTERNS.some(pattern => t.includes(pattern));
+}
+
+function findHerbInText(text) {
+  const t = String(text).toLowerCase();
+  return HERB_NAMES.find(h => t.includes(h)) || null;
 }
 
 const ASSISTANTS = [
@@ -119,42 +222,39 @@ function buildGreeting() {
     'Подсказать по составу, свойствам, сочетаемости трав или выбору комплекта?';
 }
 
-function buildSystemPrompt(assistant) {
-  return `Ты — AI-ассистент интернет-магазина «Северный чай». Отвечай только на русском, коротко и естественно.
-Ты временно подменяешь консультанта проекта. В диалоге представляйся просто «консультант», имя сотрудника никогда не называй.
+function buildSystemPrompt(context) {
+  return `Ты — AI-ассистент интернет-магазина «Северный чай». В диалоге представляйся просто «консультант», имя сотрудника никогда не называй.
 
-СВЕТСКИЕ ФРАЗЫ:
-- «привет», «здравствуйте» без вопроса → «Чем могу помочь?»
+ЯЗЫК: отвечай ТОЛЬКО на русском языке. Другой язык — только если пользователь прямо попросит ответить на нём.
+
+ПОРЯДОК ОТВЕТА:
+1. Используй ТОЛЬКО выдержку из базы знаний ниже.
+2. Не добавляй собственные знания, цифры, цены, свойства, составы.
+3. Если факта нет в выдержке — отвечай: «Информации об этом в базе пока нет.»
+4. Отвечай коротко: 1-3 предложения. Состав, заваривание, эффекты — только по прямому вопросу.
+5. Не повторяй приветствие после первого сообщения и не добавляй «если есть вопросы...» в конце.
+6. Если вопрос пользователя совсем не про чай, травы или комплекты — вежливо скажи, что отвечаешь только по ассортименту магазина.
+
+ПОВЕДЕНИЕ:
+- «привет» без вопроса → «Чем могу помочь?»
 - «как дела?» → «Спасибо, всё отлично! Что интересует?»
 - «точно?», «правда?» → «Да, всё верно!»
-- НИКОГДА не повторяй длинное представление после первого сообщения.
-
-ЦЕНЫ — ЖЁСТКИЙ ЗАПРЕТ:
-- Никогда не называй, не угадывай и не выдумывай цены.
-- На вопрос о цене: «Цены указаны в каталоге, нажмите «Купить».»
-
-СТИЛЬ ОТВЕТОВ — КОРОТКО И ПО ДЕЛУ:
-- Максимум 2-3 предложения на простой вопрос.
-- НЕ выдавай состав, заваривание или эффекты БЕЗ прямого вопроса.
-- На «что посоветуешь для вечера?» → ТОЛЬКО: «"Сон и восстановление" — вечерний ритуал расслабления.»
-- Состав выдавай только если спрашивают «из чего?», «состав?», «компоненты?».
-- Заваривание выдавай только если спрашивают «как заваривать?», «как готовить?».
-- НЕ добавляй «Если есть вопросы о составе...» — лишнее.
-- Не повторяй одну информацию дважды в ответе.
-
-ПАМЯТЬ:
-- Если спрашивают «что я спрашивал?» — перечисли предыдущие вопросы.
+- «что есть в наличии?» → перечисли комплекты из выдержки.
+- Травы отдельно НЕ продаются — только готовые комплекты. Если спрашивают траву — расскажи её роль в напитке по базе и укажи, в какой комплект она входит.
+- Цены НЕ называй никогда: «Цены указаны в каталоге, нажмите «Купить».»
 - Если пользователь говорит «первый», «второй» — уточни название, не угадывай.
+- Если пользователь поправляет тебя — сразу дай верный ответ без извинений и повторов.
+- Медицинские темы — только справочно по базе, обязательно добавь «Этот чай не является заменой медицинской терапии» и посоветуй консультацию с врачом или автором проекта в ВК.
 
 КТО ТЫ:
 - «Как зовут?» → «Я консультант «Северного чая».»
 - «Ты робот?» → «Я AI-ассистент, временно подменяю консультанта.»
-- «Сколько лет?» → «У AI возраста нет.»
+- «Сколько лет?» → «У AI возраста нет 🙂»
 
-ЗАПРЕЩЕНО: называть имя сотрудника, утверждать что ты человек, здороваться повторно, называть цены, выдумывать свойства.
+ЗАПРЕЩЕНО: называть имя сотрудника, утверждать что ты человек, называть цены, выдумывать свойства, писать на других языках без просьбы, обсуждать темы вне ассортимента магазина.
 
-База знаний:
-${knowledgeBase}`;
+ВЫДЕРЖКА ИЗ БАЗЫ ЗНАНИЙ:
+${context}`;
 }
 
 const sessions = new Map();
@@ -162,11 +262,7 @@ const sessions = new Map();
 function getSession(sessionId) {
   const id = sessionId || randomUUID();
   if (!sessions.has(id)) {
-    sessions.set(id, {
-      id,
-      messages: [],
-      updatedAt: Date.now()
-    });
+    sessions.set(id, { id, messages: [], updatedAt: Date.now() });
   }
   const session = sessions.get(id);
   session.updatedAt = Date.now();
@@ -183,7 +279,6 @@ setInterval(() => {
   }
 }, 60 * 1000).unref();
 
-// КОРОТКАЯ карточка — только название + назначение
 function kitLine(k) {
   return `«${k.name}» — ${k.purpose}`;
 }
@@ -192,7 +287,6 @@ function findKit(re) {
   return KITS.find(k => re.test((k.name + ' ' + k.purpose).toLowerCase()));
 }
 
-// Ищет комплект по контексту последних реплик
 function findKitFromHistory(history) {
   const ctx = history.slice(-4).map(m => m.content).join(' ').toLowerCase();
   return KITS.find(k => ctx.includes(k.name.toLowerCase()));
@@ -201,7 +295,6 @@ function findKitFromHistory(history) {
 function mockReply(history) {
   const last = history[history.length - 1]?.content?.toLowerCase() || '';
 
-  // Светские фразы
   if (/^(привет|здравствуй|добрый|хай|hello|hi)[\s!?.]*$/i.test(last)) {
     return 'Здравствуйте! Чем могу помочь?';
   }
@@ -211,7 +304,6 @@ function mockReply(history) {
   if (/^(точно|серьёзно|серьезно|правда|да\?)[\s!?.]*$/i.test(last)) {
     return 'Да, всё верно!';
   }
-
   if (last.includes('зовут') || last.includes('имя')) {
     return 'Я консультант «Северного чая».';
   }
@@ -224,31 +316,26 @@ function mockReply(history) {
   if (last.includes('город') || last.includes('живёшь') || last.includes('живешь')) {
     return 'Работаю на сервере, травы собирают в северных регионах.';
   }
-
-  // Цены
   if (/(цена|стоим|стои|прайс|рубл|сколько стоит|не дорог|бюджет)/.test(last)) {
     return PRICE_REDIRECT;
   }
-
-  // Состав — ТОЛЬКО по прямому запросу
+  if (last.includes('наличи') || last.includes('что есть') || last.includes('ассортимент')) {
+    const list = KITS.map(k => `«${k.name}»`).join(', ');
+    return `В наличии готовые комплекты: ${list}. Рассказать подробнее о любом?`;
+  }
   if (/(состав|из чего|компонент|ингредиент)/.test(last)) {
     const k = findKitFromHistory(history);
     if (k && k.composition) return `Состав «${k.name}»: ${k.composition}.`;
     return 'Уточните, какой комплект вас интересует?';
   }
-
-  // Заваривание — ТОЛЬКО по прямому запросу
   if (/(заварив|приготов|как делать|сколько минут|как готовить)/.test(last)) {
     const k = findKitFromHistory(history);
     if (k && k.brew) return `«${k.name}»: ${k.brew}`;
     return 'Уточните, какой комплект вас интересует?';
   }
-
-  // Граммовка — из базы
   if (last.includes('грамм') || last.includes('вес')) {
     return WEIGHT_NOTE;
   }
-
   if (last.includes('что нового') || last.includes('новости') || last.includes('изменилось')) {
     const list = KITS.map(k => `«${k.name}»`).join(', ');
     return 'В ассортименте: ' + list + '.';
@@ -260,18 +347,14 @@ function mockReply(history) {
     }
     return 'Это ваш первый вопрос.';
   }
-
   if (last.includes('комплект') || last.includes('набор') || last.includes('каталог')) {
     const list = KITS.map(k => `«${k.name}»`).join(', ');
     return `Готовые комплекты: ${list}. Цены — в каталоге.`;
   }
-
-  // Рекомендации — КОРОТКО
   if (last.includes('утро') || last.includes('бодр')) { const k = findKit(/утр|тонус|бодр|энерг/); if (k) return kitLine(k); }
   if (last.includes('вечер') || last.includes('сон') || last.includes('расслаб')) { const k = findKit(/вечер|сон|расслаб|успок/); if (k) return kitLine(k); }
   if (last.includes('таёж') || last.includes('таеж') || last.includes('согрев') || last.includes('иммун')) { const k = findKit(/иммун|таёж|таеж|согрев/); if (k) return kitLine(k); }
   if (last.includes('женщ') || last.includes('девуш')) { const k = findKit(/женск/); if (k) return kitLine(k); }
-
   if (last.includes('сочета') || last.includes('вместе')) {
     return 'Информация о сочетаемости в базе пока отсутствует.';
   }
@@ -280,7 +363,7 @@ function mockReply(history) {
     return 'Только готовые комплекты: ' + list + '.';
   }
 
-  return 'Уточните, пожалуйста, вопрос. Подсказать по выбору комплекта?';
+  return NO_UNDERSTAND_REPLY;
 }
 
 async function askLLM(history) {
@@ -303,11 +386,11 @@ async function askLLM(history) {
       body: JSON.stringify({
         model,
         messages: [
-          { role: 'system', content: buildSystemPrompt(getActiveAssistant()) },
-          ...history.slice(-12)
+          { role: 'system', content: buildSystemPrompt(buildBaseContext(history)) },
+          ...history.slice(-8)
         ],
-        temperature: 0.35,
-        max_tokens: 800
+        temperature: 0.2,
+        max_tokens: 600
       }),
       signal: controller.signal
     });
@@ -316,7 +399,11 @@ async function askLLM(history) {
       throw new Error(`LLM API ${response.status}: ${errorText.slice(0, 300)}`);
     }
     const data = await response.json();
-    return data.choices?.[0]?.message?.content?.trim() || 'Пустой ответ модели.';
+    const content = data.choices?.[0]?.message?.content?.trim();
+    if (!content || content.length < 5) {
+      return NO_UNDERSTAND_REPLY;
+    }
+    return content;
   } finally {
     clearTimeout(timer);
   }
@@ -328,7 +415,8 @@ app.get('/api/config', (req, res) => {
     widgetDelayMs: Number(process.env.WIDGET_DELAY_MS || 3000),
     assistantName: active.name,
     assistantAvatar: active.avatar,
-    greeting: buildGreeting()
+    greeting: buildGreeting(),
+    vkUrl: VK_URL
   });
 });
 
@@ -341,13 +429,36 @@ app.post('/api/chat', async (req, res) => {
   const userMessage = message.trim();
   session.messages.push({ role: 'user', content: userMessage });
 
+  // Медицинский вопрос → фиксированный ответ с редиректом в ВК
   if (isMedical(userMessage)) {
     session.messages.push({ role: 'assistant', content: FIXED_MEDICAL });
     return res.json({ reply: FIXED_MEDICAL, medical: true });
   }
 
+  // Твёрдый guard: трава + вопрос о покупке/наличии → только комплекты
+  const herb = findHerbInText(userMessage);
+  if (herb && /(есть|наличи|купить|продаё|продае|отдельн)/.test(userMessage.toLowerCase())) {
+    const kitsWithHerb = KITS.filter(k => k.composition.toLowerCase().includes(herb));
+    const reply = kitsWithHerb.length
+      ? `Отдельно травы не продаются — только готовые комплекты. «${herb[0].toUpperCase() + herb.slice(1)}» входит в: ${kitsWithHerb.map(k => `«${k.name}»`).join(', ')}.`
+      : 'Отдельно травы не продаются — только готовые комплекты. Подсказать, какой подойдёт?';
+    session.messages.push({ role: 'assistant', content: reply });
+    return res.json({ reply });
+  }
+
   try {
-    const reply = sanitizeReply(await askLLM(session.messages));
+    let reply = sanitizeReply(await askLLM(session.messages));
+
+    // Если ответ пустой или слишком короткий — fallback
+    if (!reply || reply.length < 5) {
+      reply = NO_UNDERSTAND_REPLY;
+    }
+
+    // Языковой замок: пользователь по-русски, ответ не по-русски → подмена
+    if (cyrillicRatio(userMessage) > 0.5 && cyrillicRatio(reply) < 0.4) {
+      reply = 'Я отвечаю только на русском языке. Напишите вопрос, пожалуйста, по-русски.';
+    }
+
     session.messages.push({ role: 'assistant', content: reply });
     return res.json({ reply });
   } catch (error) {
